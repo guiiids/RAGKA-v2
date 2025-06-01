@@ -356,6 +356,10 @@ async def promptflow_request(request):
         }
         # Adding timeout for scenarios where response takes longer to come back
         logging.debug(f"Setting timeout to {app_settings.promptflow.response_timeout}")
+        logging.debug(f"PromptFlow System Prompt: {app_settings.azure_openai.system_message}")
+        logging.debug(f"PromptFlow Model: {app_settings.azure_openai.model}")
+        logging.debug(f"PromptFlow Temperature: {app_settings.azure_openai.temperature}")
+        logging.debug(f"PromptFlow Max Tokens: {app_settings.azure_openai.max_tokens}")
         async with httpx.AsyncClient(
             timeout=float(app_settings.promptflow.response_timeout)
         ) as client:
@@ -1059,5 +1063,6 @@ async def generate_title(conversation_messages) -> str:
         logging.exception("Exception while generating title", e)
         return messages[-2]["content"]
 
-
-app = create_app()
+if __name__ == "__main__":
+    app = create_app()
+    app.run(host="0.0.0.0", port=5005)
