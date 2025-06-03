@@ -1,5 +1,5 @@
 .questionInputContainer {
-  height: 120px;
+  /* height: 120px; Removed to allow dynamic height */
   position: absolute;
   left: 6.5%;
   right: 0%;
@@ -9,16 +9,21 @@
   box-shadow:
     0px 8px 16px rgba(0, 0, 0, 0.14),
     0px 0px 2px rgba(0, 0, 0, 0.12);
-  border-radius: 8px;
+  border-radius: 8px; /* This will round the overall container */
 }
 
 .questionInputTextArea {
   width: 100%;
-  line-height: 40px;
-  margin-top: 10px;
-  margin-bottom: 10px;
+  /* line-height: 40px; Adjusted by TextField's autoAdjustHeight and rows/maxRows */
+  /* margin-top: 10px; */ /* Let's try removing fixed margins for better auto-height fit */
+  /* margin-bottom: 10px; */
   margin-left: 12px;
   margin-right: 12px;
+  padding-top: 10px; /* Add padding for spacing within the text area */
+  padding-bottom: 10px; /* Add padding for spacing, especially for single line */
+  align-self: stretch; /* Ensure it stretches vertically if container allows */
+  display: flex; /* To help with vertical alignment if needed */
+  align-items: center; /* Vertically center text for single line */
 }
 
 .questionInputSendButtonContainer {

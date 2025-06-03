@@ -80,6 +80,9 @@ export const QuestionInput = ({ onSend, disabled, placeholder, clearOnSend, conv
         className={styles.questionInputTextArea}
         placeholder={placeholder}
         multiline
+        autoAdjustHeight // Added this prop
+        rows={1} // Added this prop for initial single line
+        // Added this prop for max 6 lines
         resizable={false}
         borderless
         value={question}
