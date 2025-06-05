@@ -1,0 +1,541 @@
+"""
+RAG Service - Converted from existing rag_assistant.py for FastAPI backend
+Handles Azure OpenAI and Azure Cognitive Search integration with streaming support
+"""
+ 
+import logging
+import json
+import asyncio
+from typing import List, Dict, Tuple, Optional, AsyncGenerator
+from datetime import datetime
+ 
+from openai import AzureOpenAI
+from azure.search.documents import SearchClient
+from azure.search.documents.models import VectorizedQuery, QueryType
+from azure.core.credentials import AzureKeyCredential
+ 
+# Import config from parent directory
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+ 
+from config import (
+    # Azure OpenAI
+    OPENAI_ENDPOINT,
+    OPENAI_KEY,
+    OPENAI_API_VERSION,
+    EMBEDDING_DEPLOYMENT,
+    CHAT_DEPLOYMENT,
+    # Azure Cognitive Search
+    SEARCH_ENDPOINT,
+    SEARCH_INDEX,
+    SEARCH_KEY,
+    VECTOR_FIELD,
+    SEARCH_KNN,
+    SEARCH_TOP,
+    SEARCH_TITLE_FIELDS,
+    SEARCH_DEFAULT_TITLE,
+    # Semantic Search Configuration
+    USE_SEMANTIC_SEARCH,
+    SEMANTIC_CONFIG_NAME,
+    SEMANTIC_STRICTNESS,
+    SEARCH_SELECT_FIELDS,
+    # RAG & ranking parameters
+    SIMILARITY_THRESHOLD,
+    CONTEXT_RESULT_COUNT,
+    CONTEXT_DEFAULT_URL,
+    CONTEXT_DEFAULT_CATEGORY,
+    # Chat controls
+    CHAT_SYSTEM_PROMPT,
+    CHAT_MAX_TOKENS,
+    CHAT_TEMPERATURE,
+    CHAT_PRESENCE_PENALTY,
+    CHAT_FREQUENCY_PENALTY,
+    CHAT_CITATION_WARNING,
+)
+ 
+from .models import StreamEvent, SourceCitation
+ 
+logger = logging.getLogger(__name__)
+ 
+# Debug logging for semantic search configuration
+logger.info(f"USE_SEMANTIC_SEARCH configuration loaded as: {USE_SEMANTIC_SEARCH}")
+ 
+ 
+class RAGService:
+    """
+    Modern RAG service with streaming support for FastAPI backend
+    Converted from existing AzureRAGAssistant class
+    """
+ 
+    def __init__(self) -> None:
+        """Initialize RAG service with Azure clients"""
+        self._initialize_configuration()
+        self._configure_openai()
+        logger.info("RAG Service initialized successfully")
+ 
+    def _initialize_configuration(self) -> None:
+        """Pull settings from config.py and fail fast if anything is missing."""
+        try:
+            # Azure OpenAI
+            self.openai_endpoint = OPENAI_ENDPOINT
+            self.openai_key = OPENAI_KEY
+            self.embedding_deployment = EMBEDDING_DEPLOYMENT
+            self.chat_deployment = CHAT_DEPLOYMENT
+ 
+            # Azure Cognitive Search
+            self.search_endpoint = SEARCH_ENDPOINT
+            self.search_index = SEARCH_INDEX
+            self.search_key = SEARCH_KEY
+            self.vector_field = VECTOR_FIELD
+        except Exception as exc:
+            logger.error("Configuration initialization error: %s", exc)
+            raise ValueError("Missing required configuration settings") from exc
+ 
+    def _configure_openai(self) -> None:
+        """Create a dedicated AzureOpenAI client."""
+        self.aoai = AzureOpenAI(
+            api_key=self.openai_key,
+            api_version=OPENAI_API_VERSION,
+            azure_endpoint=self.openai_endpoint,
+        )
+ 
+    async def generate_embedding(self, text: str) -> Optional[List[float]]:
+        """Generate embedding vector for text (async wrapper)"""
+        if not text:
+            logger.warning("Empty text provided for embedding generation")
+            return None
+       
+        try:
+            # Run in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            resp = await loop.run_in_executor(
+                None,
+                lambda: self.aoai.embeddings.create(
+                    input=[text.strip()],
+                    model=self.embedding_deployment,
+                )
+            )
+            return resp.data[0].embedding
+        except Exception as exc:
+            logger.error("Embedding generation error: %s", exc)
+            return None
+ 
+    async def search_knowledge_base(self, query: str) -> List[Dict]:
+        """
+        Run search against Azure Cognitive Search using either semantic or vector search
+        Based on USE_SEMANTIC_SEARCH configuration flag
+        """
+        start_time = asyncio.get_event_loop().time()
+       
+        # Debug: Log the current configuration value at search time
+        logger.info(f"search_knowledge_base called with USE_SEMANTIC_SEARCH={USE_SEMANTIC_SEARCH} (type: {type(USE_SEMANTIC_SEARCH)})")
+       
+        try:
+            search_client = SearchClient(
+                endpoint=f"https://{self.search_endpoint}.search.windows.net",
+                index_name=self.search_index,
+                credential=AzureKeyCredential(self.search_key),
+            )
+ 
+            loop = asyncio.get_event_loop()
+ 
+            # Use the configured USE_SEMANTIC_SEARCH from config.py
+            use_semantic = USE_SEMANTIC_SEARCH.lower() == "true" if isinstance(USE_SEMANTIC_SEARCH, str) else bool(USE_SEMANTIC_SEARCH)
+            logger.info(f"Using configured USE_SEMANTIC_SEARCH: {use_semantic}")
+           
+            if use_semantic:
+                # ── Semantic Search Path ──
+                logger.info("Using semantic search mode")
+               
+                # Use consistent fields for semantic search to match white version
+                select_fields = ["chunk"]
+               
+                # Add title fields that exist (same logic as vector search)
+                try:
+                    # Probe the index to see what fields are available
+                    probe_results = await loop.run_in_executor(
+                        None,
+                        lambda: list(search_client.search(search_text="*", top=1))
+                    )
+                    available_fields = list(probe_results[0].keys()) if probe_results and probe_results[0] else ["chunk"]
+                   
+                    # Add title field if available
+                    for field_name in SEARCH_TITLE_FIELDS:
+                        if field_name in available_fields:
+                            select_fields.append(field_name)
+                            break
+                   
+                    # Add other fields if they exist
+                    if "source_url" in available_fields:
+                        select_fields.append("source_url")
+                    if "url" in available_fields:
+                        select_fields.append("url")
+                       
+                    logger.info(f"Semantic search using fields: {select_fields}")
+                       
+                except Exception as exc:
+                    logger.warning("Could not probe index fields for semantic search: %s", exc)
+                    # Use consistent fallback fields for semantic search
+                    select_fields = ["chunk", "title", "source_url"]
+               
+                # COMPREHENSIVE LOGGING - Search Parameters
+                logger.info(f"=== SEARCH PARAMETERS ===")
+                logger.info(f"Query: '{query}'")
+                logger.info(f"Semantic Config: '{SEMANTIC_CONFIG_NAME}'")
+                logger.info(f"Top Count: {SEARCH_TOP}")
+                logger.info(f"Select Fields: {select_fields}")
+                logger.info(f"Query Type: SEMANTIC")
+                logger.info(f"Query Answer: extractive")
+                logger.info(f"Query Caption: extractive")
+               
+                # Execute semantic search with proper configuration
+                results = await loop.run_in_executor(
+                    None,
+                    lambda: list(
+                        search_client.search(
+                            search_text=query,
+                            query_type=QueryType.SEMANTIC,
+                            semantic_configuration_name=SEMANTIC_CONFIG_NAME,
+                            top=SEARCH_TOP,
+                            select=select_fields,
+                            query_answer="extractive",
+                            query_caption="extractive",
+                        )
+                    )
+                )
+               
+                search_time = asyncio.get_event_loop().time() - start_time
+               
+                # COMPREHENSIVE LOGGING - Raw Results
+                logger.info(f"=== RAW AZURE SEARCH RESULTS ===")
+                logger.info(f"Total results returned from Azure: {len(results)}")
+                logger.info(f"Search completed in {search_time:.2f}s")
+               
+                # Log EVERY result in detail
+                for i, result in enumerate(results):
+                    logger.info(f"--- Raw Result {i+1} ---")
+                    logger.info(f"All fields: {list(result.keys())}")
+                    logger.info(f"Chunk content: '{result.get('chunk', '')[:200]}...' (length: {len(result.get('chunk', ''))})")
+                    logger.info(f"Title: '{result.get('title', 'NO_TITLE')}'")
+                    logger.info(f"Source URL: '{result.get('source_url', 'NO_URL')}'")
+                    logger.info(f"Has @search.score: {'@search.score' in result}")
+                    logger.info(f"Has @search.rerankerScore: {'@search.rerankerScore' in result}")
+                    if '@search.score' in result:
+                        logger.info(f"@search.score: {result.get('@search.score')}")
+                    if '@search.rerankerScore' in result:
+                        logger.info(f"@search.rerankerScore: {result.get('@search.rerankerScore')}")
+               
+            else:
+                # ── Vector Search Path (Legacy) ──
+                logger.info("Using vector search mode")
+               
+                # Generate query embedding
+                query_embedding = await self.generate_embedding(query)
+                if not query_embedding:
+                    logger.warning("Failed to generate embedding for query")
+                    return []
+ 
+                # Prepare vector query
+                vector_query = VectorizedQuery(
+                    vector=query_embedding,
+                    k_nearest_neighbors=SEARCH_KNN,
+                    fields=self.vector_field,
+                )
+ 
+                # Determine available fields (existing probing logic)
+                select_fields = ["chunk"]
+               
+                try:
+                    # Correctly wrap the probing call
+                    probe_results = await loop.run_in_executor(
+                        None,
+                        lambda: list(search_client.search(search_text="*", top=1))
+                    )
+                    available_fields = list(probe_results[0].keys()) if probe_results and probe_results[0] else ["chunk"]
+                   
+                    for field_name in SEARCH_TITLE_FIELDS:
+                        if field_name in available_fields:
+                            select_fields.append(field_name)
+                            break
+                except Exception as exc:
+                    logger.warning("Could not inspect index fields during probing: %s", exc)
+                    # Fallback: if probing fails, select_fields remains ["chunk"]
+ 
+                # Execute vector search
+                results = await loop.run_in_executor(
+                    None,
+                    lambda: list(search_client.search(
+                        search_text=query,
+                        vector_queries=[vector_query],
+                        top=SEARCH_TOP,
+                        select=select_fields,
+                    ))
+                )
+               
+                search_time = asyncio.get_event_loop().time() - start_time
+                logger.info(f"Vector search completed in {search_time:.2f}s, found {len(results)} results")
+ 
+            # ── Shared Result Processing ──
+            processed: List[Dict] = []
+            for i, result in enumerate(results):
+                title = next(
+                    (result[field] for field in SEARCH_TITLE_FIELDS if field in result),
+                    SEARCH_DEFAULT_TITLE,
+                )
+                if isinstance(title, str):
+                    # Normalize file paths to bare filename without extension
+                    title = title.replace("\\", "/").split("/")[-1].rsplit(".", 1)[0]
+               
+                chunk_content = result.get("chunk", "")
+               
+                # Debug: Log each result processing
+                logger.info(f"Processing result {i+1}: title='{title}', chunk_length={len(chunk_content)}, has_chunk={bool(chunk_content.strip())}")
+               
+                processed.append({
+                    "chunk": chunk_content,
+                    "title": title,
+                    "relevance": 1.0,  # Search results already ordered by relevance
+                    "url": result.get("source_url", result.get("url", CONTEXT_DEFAULT_URL)),
+                    "category": result.get("category", CONTEXT_DEFAULT_CATEGORY),
+                })
+           
+            total_time = asyncio.get_event_loop().time() - start_time
+            search_mode = "semantic" if use_semantic else "vector"
+            logger.info(f"Search completed using {search_mode} mode in {total_time:.2f}s, returning {len(processed)} processed results")
+           
+            return processed
+ 
+        except Exception as exc:
+            logger.error("Knowledge base search error: %s", exc)
+            return []
+ 
+    def _prepare_context(self, search_results: List[Dict]) -> Tuple[str, Dict]:
+        """Convert top N search chunks into context prompt and source map."""
+        context_entries, source_map = [], {}
+       
+        # COMPREHENSIVE LOGGING - Context Preparation
+        logger.info(f"=== CONTEXT PREPARATION ===")
+        logger.info(f"Input search results: {len(search_results)}")
+        logger.info(f"CONTEXT_RESULT_COUNT limit: {CONTEXT_RESULT_COUNT}")
+        logger.info(f"Will process first {min(len(search_results), CONTEXT_RESULT_COUNT)} results")
+       
+        for i, result in enumerate(search_results[:CONTEXT_RESULT_COUNT], 1):
+            sid = f"Source_{i}"
+            chunk = result.get("chunk", "").strip()
+           
+            # DETAILED logging for each result in _prepare_context
+            logger.info(f"=== Context Result {i} ===")
+            logger.info(f"Title: '{result.get('title', 'N/A')}'")
+            logger.info(f"Chunk length: {len(chunk)}")
+            logger.info(f"Chunk preview: '{chunk[:100]}...'")
+            logger.info(f"Chunk is empty: {not bool(chunk)}")
+            logger.info(f"URL: '{result.get('url', 'N/A')}'")
+           
+            if chunk:
+                context_entries.append(f"{sid}: {chunk}")
+                source_map[sid] = {
+                    "title": result.get("title", SEARCH_DEFAULT_TITLE),
+                    "content": chunk,
+                    "url": result.get("url", CONTEXT_DEFAULT_URL),
+                    "category": result.get("category", CONTEXT_DEFAULT_CATEGORY),
+                    "relevance": result.get("relevance", 1.0),
+                }
+                logger.info(f"✓ Added {sid} to source_map")
+            else:
+                logger.warning(f"✗ Skipping result {i} - chunk is empty")
+       
+        logger.info(f"=== CONTEXT PREPARATION SUMMARY ===")
+        logger.info(f"Total input results: {len(search_results)}")
+        logger.info(f"Results processed: {min(len(search_results), CONTEXT_RESULT_COUNT)}")
+        logger.info(f"Valid sources created: {len(source_map)}")
+        logger.info(f"Context entries: {len(context_entries)}")
+        logger.info(f"Final source_map keys: {list(source_map.keys())}")
+        return "\n\n".join(context_entries), source_map
+ 
+    async def generate_streaming_response(
+        self,
+        query: str,
+        conversation_id: str
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """
+        Generate streaming RAG response with real-time updates
+        Yields StreamEvent objects for SSE
+        """
+        try:
+            # Step 1: Search knowledge base
+            yield StreamEvent(
+                type="status",
+                data={"message": "Searching knowledge base..."}
+            )
+ 
+            search_results = await self.search_knowledge_base(query)
+           
+            if not search_results:
+                yield StreamEvent(
+                    type="error",
+                    data={"message": "No relevant information found in the knowledge base."}
+                )
+                return
+ 
+            # Step 2: Prepare context and sources
+            context, source_map = self._prepare_context(search_results)
+           
+            # Step 3: Generate streaming response
+            yield StreamEvent(
+                type="status",
+                data={"message": "Generating response..."}
+            )
+ 
+            messages = [
+                {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Context:\n{context}\n\n"
+                        f"Question: {query}\n\n"
+                        "Provide a detailed answer using only the information from the context. "
+                        "Remember to cite each piece of information using [Source_X] format."
+                    ),
+                },
+            ]
+ 
+            # Create streaming chat completion
+            stream = self.aoai.chat.completions.create(
+                model=self.chat_deployment,
+                messages=messages,
+                max_tokens=CHAT_MAX_TOKENS,
+                temperature=CHAT_TEMPERATURE,
+                presence_penalty=CHAT_PRESENCE_PENALTY,
+                frequency_penalty=CHAT_FREQUENCY_PENALTY,
+                stream=True
+            )
+ 
+            full_response = ""
+           
+            # Stream the response
+            for chunk in stream:
+                if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content is not None:
+                    content = chunk.choices[0].delta.content
+                    full_response += content
+                   
+                    yield StreamEvent(
+                        type="content",
+                        data={"text": content}
+                    )
+ 
+            # Post-process the complete response
+            if not self._validate_citations(full_response, source_map):
+                citation_warning = CHAT_CITATION_WARNING
+                full_response = citation_warning + full_response
+                yield StreamEvent(
+                    type="content",
+                    data={"text": citation_warning}
+                )
+ 
+            # Replace source placeholders with friendly titles
+            for sid, meta in source_map.items():
+                full_response = full_response.replace(f"[{sid}]", f"[{meta['title']}]")
+ 
+            # Determine cited sources after full response is available
+            cited_sources = self._filter_cited_sources(full_response, source_map)
+ 
+            # Send completion event with cited sources
+            yield StreamEvent(
+                type="complete",
+                data={
+                    "conversation_id": conversation_id,
+                    "cited_sources": cited_sources, # Include the actual cited sources
+                    "response_length": len(full_response)
+                }
+            )
+ 
+        except Exception as exc:
+            logger.error(f"Streaming response generation error: {exc}")
+            yield StreamEvent(
+                type="error",
+                data={"message": f"Error generating response: {str(exc)}"}
+            )
+ 
+    async def generate_rag_response(self, query: str) -> Tuple[str, List[Dict], List[Dict]]:
+        """
+        Non-streaming RAG response (backward compatibility)
+        Returns (answer, cited_sources, recommendations)
+        """
+        try:
+            search_results = await self.search_knowledge_base(query)
+            if not search_results:
+                return "No relevant information found in the knowledge base.", [], []
+ 
+            context, source_map = self._prepare_context(search_results)
+           
+            # Generate response (non-streaming)
+            messages = [
+                {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Context:\n{context}\n\n"
+                        f"Question: {query}\n\n"
+                        "Provide a detailed answer using only the information from the context. "
+                        "Remember to cite each piece of information using [Source_X] format."
+                    ),
+                },
+            ]
+ 
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.aoai.chat.completions.create(
+                    model=self.chat_deployment,
+                    messages=messages,
+                    max_tokens=CHAT_MAX_TOKENS,
+                    temperature=CHAT_TEMPERATURE,
+                    presence_penalty=CHAT_PRESENCE_PENALTY,
+                    frequency_penalty=CHAT_FREQUENCY_PENALTY,
+                )
+            )
+           
+            answer = response.choices[0].message.content if response.choices and len(response.choices) > 0 else "No response generated"
+ 
+            # Ensure citations present
+            if not self._validate_citations(answer, source_map):
+                answer = CHAT_CITATION_WARNING + answer
+ 
+            # Replace placeholders with friendly titles
+            for sid, meta in source_map.items():
+                answer = answer.replace(f"[{sid}]", f"[{meta['title']}]")
+ 
+            cited_sources = self._filter_cited_sources(answer, source_map)
+            return answer, cited_sources, []  # No recommendations for now
+ 
+        except Exception as exc:
+            logger.error(f"RAG response generation error: {exc}")
+            return "I apologize, but I encountered an error while generating the response.", [], []
+ 
+    @staticmethod
+    def _validate_citations(answer: str, source_map: Dict) -> bool:
+        """Check if answer contains proper citations"""
+        return any(f"[{sid}]" in answer for sid in source_map)
+ 
+    @staticmethod
+    def _filter_cited_sources(answer: str, source_map: Dict) -> List[Dict]:
+        """Extract only the sources that are actually cited in the answer"""
+        cited, seen = [], set()
+        for sid, meta in source_map.items():
+            if (sid in answer or meta["title"] in answer) and sid not in seen:
+                cited.append(meta)
+                seen.add(sid)
+        return cited
+ 
+ 
+# Global service instance
+_rag_service: Optional[RAGService] = None
+ 
+ 
+def get_rag_service() -> RAGService:
+    """Get singleton RAG service instance"""
+    global _rag_service
+    if _rag_service is None:
+        _rag_service = RAGService()
+    return _rag_service
